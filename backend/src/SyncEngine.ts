@@ -6,6 +6,7 @@ export interface RecordPayload {
 
 export interface SyncRecord {
   id: string;
+  tenant_id: string;
   payload: RecordPayload;
   data_type: 'reference' | 'transactional';
   last_modified_at: Date;
@@ -15,20 +16,19 @@ export interface SyncRecord {
 
 export class SyncEngine {
   private db: Client | Pool;
-  private referenceInterval: NodeJS.Timeout | null = null;
-  private transactionalInterval: NodeJS.Timeout | null = null;
+  private intervals: NodeJS.Timeout[] = [];
 
   constructor(db: Client | Pool) {
     this.db = db;
   }
 
   /**
-   * Retrieves the last sync watermark for a given client (or a default ID if single-client).
+   * Retrieves the last sync watermark for a given client and tenant.
    */
-  async getWatermark(watermarkId: string = 'default'): Promise<Date> {
+  async getWatermark(tenantId: string, watermarkId: string = 'default'): Promise<Date> {
     const result = await this.db.query(
-      `SELECT last_sync_at FROM sync_watermarks WHERE id = $1`,
-      [watermarkId]
+      `SELECT last_sync_at FROM sync_watermarks WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, watermarkId]
     );
     if (result.rows.length > 0) {
       return result.rows[0].last_sync_at;
@@ -40,21 +40,22 @@ export class SyncEngine {
   /**
    * Updates the sync watermark to a new timestamp.
    */
-  async updateWatermark(watermarkId: string, timestamp: Date): Promise<void> {
+  async updateWatermark(tenantId: string, watermarkId: string, timestamp: Date): Promise<void> {
     await this.db.query(
       `
-      INSERT INTO sync_watermarks (id, last_sync_at) 
-      VALUES ($1, $2)
-      ON CONFLICT (id) DO UPDATE SET last_sync_at = EXCLUDED.last_sync_at
+      INSERT INTO sync_watermarks (id, tenant_id, last_sync_at) 
+      VALUES ($1, $2, $3)
+      ON CONFLICT (tenant_id, id) DO UPDATE SET last_sync_at = EXCLUDED.last_sync_at
       `,
-      [watermarkId, timestamp]
+      [watermarkId, tenantId, timestamp]
     );
   }
 
   /**
-   * Queries the delta of records modified after the given watermark, filtered by data type.
+   * Queries the delta of records modified after the given watermark, filtered by data type and tenant.
    */
   async getDelta(
+    tenantId: string,
     tableName: 'client_records' | 'cloud_records', 
     watermark: Date,
     dataType?: 'reference' | 'transactional'
@@ -63,11 +64,11 @@ export class SyncEngine {
       throw new Error('Invalid table name');
     }
 
-    let query = `SELECT * FROM ${tableName} WHERE last_modified_at > $1`;
-    const params: any[] = [watermark];
+    let query = `SELECT * FROM ${tableName} WHERE tenant_id = $1 AND last_modified_at > $2`;
+    const params: any[] = [tenantId, watermark];
 
     if (dataType) {
-      query += ` AND data_type = $2`;
+      query += ` AND data_type = $3`;
       params.push(dataType);
     }
     
@@ -78,30 +79,30 @@ export class SyncEngine {
   }
 
   /**
-   * Processes the sync for a given data type.
+   * Processes the sync for a given data type and tenant.
    */
-  async processSync(dataType: 'reference' | 'transactional') {
-    console.log(`Processing ${dataType} sync at ${new Date().toISOString()}`);
+  async processSync(tenantId: string, dataType: 'reference' | 'transactional') {
+    console.log(`Processing ${dataType} sync for tenant ${tenantId} at ${new Date().toISOString()}`);
     const watermarkId = `${dataType}_sync`;
-    const watermark = await this.getWatermark(watermarkId);
+    const watermark = await this.getWatermark(tenantId, watermarkId);
 
-    const clientDelta = await this.getDelta('client_records', watermark, dataType);
-    const cloudDelta = await this.getDelta('cloud_records', watermark, dataType);
+    const clientDelta = await this.getDelta(tenantId, 'client_records', watermark, dataType);
+    const cloudDelta = await this.getDelta(tenantId, 'cloud_records', watermark, dataType);
 
-    await this.resolveConflicts(clientDelta, cloudDelta);
+    await this.resolveConflicts(tenantId, clientDelta, cloudDelta);
 
     // Update watermark after successful sync to the highest processed timestamp
     const allRecords = [...clientDelta, ...cloudDelta];
     if (allRecords.length > 0) {
       const highestTimestamp = new Date(Math.max(...allRecords.map(r => r.last_modified_at.getTime())));
-      await this.updateWatermark(watermarkId, highestTimestamp);
+      await this.updateWatermark(tenantId, watermarkId, highestTimestamp);
     }
   }
 
   /**
    * Resolves conflicts between client and cloud records.
    */
-  async resolveConflicts(clientRecords: SyncRecord[], cloudRecords: SyncRecord[]): Promise<void> {
+  async resolveConflicts(tenantId: string, clientRecords: SyncRecord[], cloudRecords: SyncRecord[]): Promise<void> {
     const clientMap = new Map<string, SyncRecord>();
     const cloudMap = new Map<string, SyncRecord>();
     
@@ -147,54 +148,56 @@ export class SyncEngine {
 
   private async sendToDLQ(record: SyncRecord, reason: string): Promise<void> {
     await this.db.query(
-      `INSERT INTO dead_letter_queue (id, payload, data_type, last_modified_at, modified_by, is_critical, reason)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, reason = EXCLUDED.reason`,
-      [record.id, record.payload, record.data_type, record.last_modified_at, record.modified_by, record.is_critical, reason]
+      `INSERT INTO dead_letter_queue (id, tenant_id, payload, data_type, last_modified_at, modified_by, is_critical, reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (tenant_id, id) DO UPDATE SET payload = EXCLUDED.payload, reason = EXCLUDED.reason`,
+      [record.id, record.tenant_id, record.payload, record.data_type, record.last_modified_at, record.modified_by, record.is_critical, reason]
     );
   }
 
   private async writeToCloud(record: SyncRecord): Promise<void> {
     await this.db.query(
-      `INSERT INTO cloud_records (id, payload, data_type, last_modified_at, modified_by, is_critical)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, last_modified_at = EXCLUDED.last_modified_at, modified_by = EXCLUDED.modified_by, is_critical = EXCLUDED.is_critical`,
-      [record.id, record.payload, record.data_type, record.last_modified_at, record.modified_by, record.is_critical]
+      `INSERT INTO cloud_records (id, tenant_id, payload, data_type, last_modified_at, modified_by, is_critical)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (tenant_id, id) DO UPDATE SET payload = EXCLUDED.payload, last_modified_at = EXCLUDED.last_modified_at, modified_by = EXCLUDED.modified_by, is_critical = EXCLUDED.is_critical`,
+      [record.id, record.tenant_id, record.payload, record.data_type, record.last_modified_at, record.modified_by, record.is_critical]
     );
   }
 
   private async writeToClient(record: SyncRecord): Promise<void> {
     await this.db.query(
-      `INSERT INTO client_records (id, payload, data_type, last_modified_at, modified_by, is_critical)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, last_modified_at = EXCLUDED.last_modified_at, modified_by = EXCLUDED.modified_by, is_critical = EXCLUDED.is_critical`,
-      [record.id, record.payload, record.data_type, record.last_modified_at, record.modified_by, record.is_critical]
+      `INSERT INTO client_records (id, tenant_id, payload, data_type, last_modified_at, modified_by, is_critical)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (tenant_id, id) DO UPDATE SET payload = EXCLUDED.payload, last_modified_at = EXCLUDED.last_modified_at, modified_by = EXCLUDED.modified_by, is_critical = EXCLUDED.is_critical`,
+      [record.id, record.tenant_id, record.payload, record.data_type, record.last_modified_at, record.modified_by, record.is_critical]
     );
   }
 
   /**
-   * Starts separate intervals for Reference (less frequent) and Transactional (continuous) data.
+   * Starts separate intervals for Reference (less frequent) and Transactional (continuous) data for multiple tenants concurrently.
    */
-  startSyncIntervals(referenceMs: number = 60000, transactionalMs: number = 5000) {
-    if (this.referenceInterval || this.transactionalInterval) {
+  startSyncIntervals(tenantIds: string[], referenceMs: number = 60000, transactionalMs: number = 5000) {
+    if (this.intervals.length > 0) {
       throw new Error('Intervals are already running');
     }
 
-    // Reference data syncs less frequently
-    this.referenceInterval = setInterval(() => {
-      this.processSync('reference').catch(console.error);
-    }, referenceMs);
+    for (const tenantId of tenantIds) {
+      // Reference data syncs less frequently
+      this.intervals.push(setInterval(() => {
+        this.processSync(tenantId, 'reference').catch(console.error);
+      }, referenceMs));
 
-    // Transactional data syncs continuously
-    this.transactionalInterval = setInterval(() => {
-      this.processSync('transactional').catch(console.error);
-    }, transactionalMs);
+      // Transactional data syncs continuously
+      this.intervals.push(setInterval(() => {
+        this.processSync(tenantId, 'transactional').catch(console.error);
+      }, transactionalMs));
+    }
   }
 
   stopSyncIntervals() {
-    if (this.referenceInterval) clearInterval(this.referenceInterval);
-    if (this.transactionalInterval) clearInterval(this.transactionalInterval);
-    this.referenceInterval = null;
-    this.transactionalInterval = null;
+    for (const interval of this.intervals) {
+      clearInterval(interval);
+    }
+    this.intervals = [];
   }
 }
