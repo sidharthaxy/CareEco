@@ -333,3 +333,5 @@ The dashboard displays:
 - ✅ Sync status indicators
 
 ---
+## AI disclamer
+AI was used for the initialization of the project,bug fixes ,test case generation and readme writting.

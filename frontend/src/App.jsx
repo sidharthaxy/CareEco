@@ -4,7 +4,7 @@ function App() {
   const [data, setData] = useState({ clientRecords: [], cloudRecords: [], deadLetterQueue: [] });
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const fetchData = () => {
     fetch('http://localhost:3000/api/data')
       .then(res => res.json())
       .then(d => {
@@ -15,7 +15,18 @@ function App() {
         console.error(err);
         setLoading(false);
       });
+  };
+
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, 2000); // Auto-refresh for test runs
+    return () => clearInterval(interval);
   }, []);
+
+  const clearData = () => {
+    fetch('http://localhost:3000/api/data', { method: 'DELETE' })
+      .then(() => fetchData());
+  };
 
   const renderTable = (title, records, expectedDesc) => (
     <div className="flex-1 bg-white p-6 rounded-xl shadow-lg border border-gray-100 flex flex-col h-full">
@@ -103,7 +114,12 @@ function App() {
             </p>
           </div>
           <div className="hidden md:block bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-            <h3 className="text-sm font-bold text-slate-800 mb-2">Rules Applied:</h3>
+            <div className="flex justify-between items-center mb-2">
+              <h3 className="text-sm font-bold text-slate-800">Rules Applied:</h3>
+              <button onClick={clearData} className="text-xs bg-red-100 hover:bg-red-200 text-red-700 px-3 py-1 rounded shadow-sm font-semibold transition-colors">
+                Clear Data
+              </button>
+            </div>
             <ul className="text-xs text-slate-600 space-y-1">
               <li className="flex items-center gap-2"><span className="text-green-500">✔</span> Rule 1: Last-Write-Wins (Default)</li>
               <li className="flex items-center gap-2"><span className="text-red-500">⭐</span> Rule 2: Critical Desktop Overrides Mobile</li>

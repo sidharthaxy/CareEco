@@ -1,6 +1,8 @@
 import { SyncEngine } from './SyncEngine';
 import { newDb } from 'pg-mem';
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 
 describe('SyncEngine', () => {
   let engine: SyncEngine;
@@ -131,6 +133,17 @@ describe('SyncEngine', () => {
     const clientRes = await engine['db'].query('SELECT * FROM client_records WHERE id = $1', [id]);
     expect(clientRes.rows).toHaveLength(1);
     expect(clientRes.rows[0].payload.val).toBe('desktop');
+    
+    // Desktop record should also be in cloud since desktop was older but won
+    const cloudRes = await engine['db'].query('SELECT * FROM cloud_records WHERE id = $1', [id]);
+
+    // Write state to file for the dashboard
+    const stateFile = path.join(__dirname, '..', 'test-state.json');
+    fs.writeFileSync(stateFile, JSON.stringify({
+      clientRecords: clientRes.rows,
+      cloudRecords: cloudRes.rows,
+      deadLetterQueue: dlqRes.rows
+    }, null, 2));
   });
 
   test('should sync reference data and transactional data independently', async () => {
