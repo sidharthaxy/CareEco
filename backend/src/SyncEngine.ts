@@ -15,6 +15,8 @@ export interface SyncRecord {
 
 export class SyncEngine {
   private db: Client | Pool;
+  private referenceInterval: NodeJS.Timeout | null = null;
+  private transactionalInterval: NodeJS.Timeout | null = null;
 
   constructor(db: Client | Pool) {
     this.db = db;
@@ -50,18 +52,65 @@ export class SyncEngine {
   }
 
   /**
-   * Queries the delta of records modified after the given watermark.
+   * Queries the delta of records modified after the given watermark, filtered by data type.
    */
-  async getDelta(tableName: 'client_records' | 'cloud_records', watermark: Date): Promise<SyncRecord[]> {
-    // Basic validation to prevent SQL injection on table name
+  async getDelta(
+    tableName: 'client_records' | 'cloud_records', 
+    watermark: Date,
+    dataType?: 'reference' | 'transactional'
+  ): Promise<SyncRecord[]> {
     if (tableName !== 'client_records' && tableName !== 'cloud_records') {
       throw new Error('Invalid table name');
     }
 
-    const result = await this.db.query(
-      `SELECT * FROM ${tableName} WHERE last_modified_at > $1 ORDER BY last_modified_at ASC`,
-      [watermark]
-    );
+    let query = `SELECT * FROM ${tableName} WHERE last_modified_at > $1`;
+    const params: any[] = [watermark];
+
+    if (dataType) {
+      query += ` AND data_type = $2`;
+      params.push(dataType);
+    }
+    
+    query += ` ORDER BY last_modified_at ASC`;
+
+    const result = await this.db.query(query, params);
     return result.rows as SyncRecord[];
+  }
+
+  /**
+   * Simulates the separate sync processes.
+   */
+  async processSync(dataType: 'reference' | 'transactional') {
+    // This is a placeholder for the actual conflict resolution (Step 5)
+    console.log(`Processing ${dataType} sync at ${new Date().toISOString()}`);
+    // Example: const watermark = await this.getWatermark(\`\${dataType}_sync\`);
+    // Example: const clientDelta = await this.getDelta('client_records', watermark, dataType);
+    // Example: const cloudDelta = await this.getDelta('cloud_records', watermark, dataType);
+  }
+
+  /**
+   * Starts separate intervals for Reference (less frequent) and Transactional (continuous) data.
+   */
+  startSyncIntervals(referenceMs: number = 60000, transactionalMs: number = 5000) {
+    if (this.referenceInterval || this.transactionalInterval) {
+      throw new Error('Intervals are already running');
+    }
+
+    // Reference data syncs less frequently
+    this.referenceInterval = setInterval(() => {
+      this.processSync('reference').catch(console.error);
+    }, referenceMs);
+
+    // Transactional data syncs continuously
+    this.transactionalInterval = setInterval(() => {
+      this.processSync('transactional').catch(console.error);
+    }, transactionalMs);
+  }
+
+  stopSyncIntervals() {
+    if (this.referenceInterval) clearInterval(this.referenceInterval);
+    if (this.transactionalInterval) clearInterval(this.transactionalInterval);
+    this.referenceInterval = null;
+    this.transactionalInterval = null;
   }
 }
